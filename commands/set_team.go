@@ -1,8 +1,6 @@
 package commands
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 
@@ -10,17 +8,40 @@ import (
 	"github.com/concourse/fly/commands/internal/displayhelpers"
 	"github.com/concourse/fly/rc"
 	"github.com/concourse/fly/ui"
-	"github.com/concourse/skymarshal/provider"
 	"github.com/vito/go-interact/interact"
 )
 
-type SetTeamCommand struct {
-	TeamName        string `short:"n" long:"team-name" required:"true"        description:"The team to create or modify"`
-	SkipInteractive bool   `long:"non-interactive" description:"Force apply configuration"`
+type ProviderConfig interface {
+	Name() string
+	DisplayName() string
+	IsConfigured() bool
+	Validate() error
+}
 
-	Auth struct {
-		Configs provider.AuthConfigs
-	} `group:"Authentication"`
+type SetTeamCommand struct {
+	TeamName        string    `short:"n" long:"team-name" required:"true" description:"The team to create or modify"`
+	SkipInteractive bool      `long:"non-interactive" description:"Force apply configuration"`
+	TeamFlags       TeamFlags `group:"Authentication"`
+}
+
+type TeamFlags struct {
+	Users  []string `json:"users" long:"user" description:"List of auth users"`
+	Groups []string `json:"groups" long:"group" description:"List of auth groups"`
+	NoAuth bool     `long:"no-really-i-dont-want-any-auth" description:"Flag to disable any authorization method for your team"`
+}
+
+func (config TeamFlags) toMap() map[string][]string {
+	auth := map[string][]string{}
+
+	if len(config.Users) > 0 {
+		auth["users"] = config.Users
+	}
+
+	if len(config.Groups) > 0 {
+		auth["groups"] = config.Groups
+	}
+
+	return auth
 }
 
 func (command *SetTeamCommand) Execute([]string) error {
@@ -40,13 +61,6 @@ func (command *SetTeamCommand) Execute([]string) error {
 	}
 
 	fmt.Println("Team Name:", command.TeamName)
-	fmt.Println("Basic Auth:", authMethodStatusDescription(command.Auth.Configs["basicauth"].IsConfigured()))
-	fmt.Println("Bitbucket Cloud Auth:", authMethodStatusDescription(command.Auth.Configs["bitbucket-cloud"].IsConfigured()))
-	fmt.Println("Bitbucket Server Auth:", authMethodStatusDescription(command.Auth.Configs["bitbucket-server"].IsConfigured()))
-	fmt.Println("GitHub Auth:", authMethodStatusDescription(command.Auth.Configs["github"].IsConfigured()))
-	fmt.Println("GitLab Auth:", authMethodStatusDescription(command.Auth.Configs["gitlab"].IsConfigured()))
-	fmt.Println("UAA Auth:", authMethodStatusDescription(command.Auth.Configs["uaa"].IsConfigured()))
-	fmt.Println("Generic OAuth:", authMethodStatusDescription(command.Auth.Configs["oauth"].IsConfigured()))
 
 	confirm := true
 	if !command.SkipInteractive {
@@ -61,32 +75,9 @@ func (command *SetTeamCommand) Execute([]string) error {
 		displayhelpers.Failf("bailing out")
 	}
 
-	providers := provider.GetProviders()
-	teamAuth := make(map[string]*json.RawMessage)
-
-	for name, config := range command.Auth.Configs {
-		if config.IsConfigured() {
-
-			p, found := providers[name]
-			if !found {
-				return errors.New("provider not found: " + name)
-			}
-
-			data, err := p.MarshalConfig(config)
-			if err != nil {
-				return err
-			}
-
-			teamAuth[name] = data
-		}
+	team := atc.Team{
+		Auth: command.TeamFlags.toMap(),
 	}
-
-	if len(teamAuth) > 1 {
-		delete(teamAuth, "noauth")
-	}
-
-	team := atc.Team{}
-	team.Auth = teamAuth
 
 	_, created, updated, err := target.Client().Team(command.TeamName).CreateOrUpdate(team)
 	if err != nil {
@@ -103,20 +94,13 @@ func (command *SetTeamCommand) Execute([]string) error {
 }
 
 func (command *SetTeamCommand) ValidateFlags() error {
-	configured := 0
 
-	for _, p := range command.Auth.Configs {
-		if p.IsConfigured() {
-			err := p.Validate()
+	if command.TeamFlags.NoAuth {
+		displayhelpers.PrintWarningHeader()
+		fmt.Fprintln(ui.Stderr, ui.WarningColor("no auth methods configured. you asked for it!"))
+		fmt.Fprintln(ui.Stderr, "")
 
-			if err != nil {
-				return err
-			}
-			configured += 1
-		}
-	}
-
-	if configured == 0 {
+	} else if len(command.TeamFlags.Groups) == 0 && len(command.TeamFlags.Users) == 0 {
 		fmt.Fprintln(ui.Stderr, "no auth methods configured! to continue, run:")
 		fmt.Fprintln(ui.Stderr, "")
 		fmt.Fprintln(ui.Stderr, "    "+ui.Embolden("fly -t %s set-team -n %s --no-really-i-dont-want-any-auth", Fly.Target, command.TeamName))
@@ -125,18 +109,5 @@ func (command *SetTeamCommand) ValidateFlags() error {
 		os.Exit(1)
 	}
 
-	if configured == 1 && command.Auth.Configs["noauth"].IsConfigured() {
-		displayhelpers.PrintWarningHeader()
-		fmt.Fprintln(ui.Stderr, ui.WarningColor("no auth methods configured. you asked for it!"))
-		fmt.Fprintln(ui.Stderr, "")
-	}
-
 	return nil
-}
-
-func authMethodStatusDescription(enabled bool) string {
-	if enabled {
-		return "enabled"
-	}
-	return "disabled"
 }
